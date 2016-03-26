@@ -41,6 +41,7 @@
 
 #include "precomp.hpp"
 #include "grfmt_jpeg.hpp"
+#include "jpeg_exif.hpp"
 
 #ifdef HAVE_JPEG
 
@@ -177,6 +178,7 @@ JpegDecoder::JpegDecoder()
     m_state = 0;
     m_f = 0;
     m_buf_supported = true;
+    m_orientation = JPEG_ORIENTATION_TL;
 }
 
 
@@ -213,7 +215,7 @@ ImageDecoder JpegDecoder::newDecoder() const
 
 bool  JpegDecoder::readHeader()
 {
-    bool result = false;
+    volatile bool result = false;
     close();
 
     JpegState* state = new JpegState;
@@ -228,7 +230,7 @@ bool  JpegDecoder::readHeader()
         if( !m_buf.empty() )
         {
             jpeg_buffer_src(&state->cinfo, &state->source);
-            state->source.pub.next_input_byte = m_buf.data;
+            state->source.pub.next_input_byte = m_buf.ptr();
             state->source.pub.bytes_in_buffer = m_buf.cols*m_buf.rows*m_buf.elemSize();
         }
         else
@@ -242,17 +244,80 @@ bool  JpegDecoder::readHeader()
         {
             jpeg_read_header( &state->cinfo, TRUE );
 
-            m_width = state->cinfo.image_width;
-            m_height = state->cinfo.image_height;
+            state->cinfo.scale_num=1;
+            state->cinfo.scale_denom = m_scale_denom;
+            m_scale_denom=1; // trick! to know which decoder used scale_denom see imread_
+            jpeg_calc_output_dimensions(&state->cinfo);
+            m_width = state->cinfo.output_width;
+            m_height = state->cinfo.output_height;
             m_type = state->cinfo.num_components > 1 ? CV_8UC3 : CV_8UC1;
             result = true;
         }
     }
 
+    m_orientation = getOrientation();
+
     if( !result )
         close();
 
     return result;
+}
+
+int JpegDecoder::getOrientation()
+{
+    int orientation = JPEG_ORIENTATION_TL;
+
+    if (m_filename.size() > 0)
+    {
+        ExifReader reader( m_filename );
+        if( reader.parse() )
+        {
+            ExifEntry_t entry = reader.getTag( ORIENTATION );
+            if (entry.tag != INVALID_TAG)
+            {
+                orientation = entry.field_u16; //orientation is unsigned short, so check field_u16
+            }
+        }
+    }
+
+    return orientation;
+}
+
+void JpegDecoder::setOrientation(Mat& img)
+{
+    switch( m_orientation )
+    {
+        case    JPEG_ORIENTATION_TL: //0th row == visual top, 0th column == visual left-hand side
+            //do nothing, the image already has proper orientation
+            break;
+        case    JPEG_ORIENTATION_TR: //0th row == visual top, 0th column == visual right-hand side
+            flip(img, img, 1); //flip horizontally
+            break;
+        case    JPEG_ORIENTATION_BR: //0th row == visual bottom, 0th column == visual right-hand side
+            flip(img, img, -1);//flip both horizontally and vertically
+            break;
+        case    JPEG_ORIENTATION_BL: //0th row == visual bottom, 0th column == visual left-hand side
+            flip(img, img, 0); //flip vertically
+            break;
+        case    JPEG_ORIENTATION_LT: //0th row == visual left-hand side, 0th column == visual top
+            transpose(img, img);
+            break;
+        case    JPEG_ORIENTATION_RT: //0th row == visual right-hand side, 0th column == visual top
+            transpose(img, img);
+            flip(img, img, 1); //flip horizontally
+            break;
+        case    JPEG_ORIENTATION_RB: //0th row == visual right-hand side, 0th column == visual bottom
+            transpose(img, img);
+            flip(img, img, -1); //flip both horizontally and vertically
+            break;
+        case    JPEG_ORIENTATION_LB: //0th row == visual left-hand side, 0th column == visual bottom
+            transpose(img, img);
+            flip(img, img, 0); //flip vertically
+            break;
+        default:
+            //by default the image read has normal (JPEG_ORIENTATION_TL) orientation
+            break;
+    }
 }
 
 /***************************************************************************
@@ -391,7 +456,7 @@ int my_jpeg_load_dht (struct jpeg_decompress_struct *info, unsigned char *dht,
 
 bool  JpegDecoder::readData( Mat& img )
 {
-    bool result = false;
+    volatile bool result = false;
     int step = (int)img.step;
     bool color = img.channels() > 1;
 
@@ -449,7 +514,7 @@ bool  JpegDecoder::readData( Mat& img )
             buffer = (*cinfo->mem->alloc_sarray)((j_common_ptr)cinfo,
                                               JPOOL_IMAGE, m_width*4, 1 );
 
-            uchar* data = img.data;
+            uchar* data = img.ptr();
             for( ; m_height--; data += step )
             {
                 jpeg_read_scanlines( cinfo, buffer, 1 );
@@ -468,8 +533,10 @@ bool  JpegDecoder::readData( Mat& img )
                         icvCvt_CMYK2Gray_8u_C4C1R( buffer[0], 0, data, 0, cvSize(m_width,1) );
                 }
             }
+
             result = true;
             jpeg_finish_decompress( cinfo );
+            setOrientation( img );
         }
     }
 
@@ -553,7 +620,7 @@ bool JpegEncoder::write( const Mat& img, const std::vector<int>& params )
         fileWrapper() : f(0) {}
         ~fileWrapper() { if(f) fclose(f); }
     };
-    bool result = false;
+    volatile bool result = false;
     fileWrapper fw;
     int width = img.cols, height = img.rows;
 
@@ -600,6 +667,9 @@ bool JpegEncoder::write( const Mat& img, const std::vector<int>& params )
         int quality = 95;
         int progressive = 0;
         int optimize = 0;
+        int rst_interval = 0;
+        int luma_quality = -1;
+        int chroma_quality = -1;
 
         for( size_t i = 0; i < params.size(); i += 2 )
         {
@@ -618,15 +688,64 @@ bool JpegEncoder::write( const Mat& img, const std::vector<int>& params )
             {
                 optimize = params[i+1];
             }
+
+            if( params[i] == CV_IMWRITE_JPEG_LUMA_QUALITY )
+            {
+                if (params[i+1] >= 0)
+                {
+                    luma_quality = MIN(MAX(params[i+1], 0), 100);
+
+                    quality = luma_quality;
+
+                    if (chroma_quality < 0)
+                    {
+                        chroma_quality = luma_quality;
+                    }
+                }
+            }
+
+            if( params[i] == CV_IMWRITE_JPEG_CHROMA_QUALITY )
+            {
+                if (params[i+1] >= 0)
+                {
+                    chroma_quality = MIN(MAX(params[i+1], 0), 100);
+                }
+            }
+
+            if( params[i] == CV_IMWRITE_JPEG_RST_INTERVAL )
+            {
+                rst_interval = params[i+1];
+                rst_interval = MIN(MAX(rst_interval, 0), 65535L);
+            }
         }
 
         jpeg_set_defaults( &cinfo );
+        cinfo.restart_interval = rst_interval;
+
         jpeg_set_quality( &cinfo, quality,
                           TRUE /* limit to baseline-JPEG values */ );
         if( progressive )
             jpeg_simple_progression( &cinfo );
         if( optimize )
             cinfo.optimize_coding = TRUE;
+
+#if JPEG_LIB_VERSION >= 70
+        if (luma_quality >= 0 && chroma_quality >= 0)
+        {
+            cinfo.q_scale_factor[0] = jpeg_quality_scaling(luma_quality);
+            cinfo.q_scale_factor[1] = jpeg_quality_scaling(chroma_quality);
+            if ( luma_quality != chroma_quality )
+            {
+                /* disable subsampling - ref. Libjpeg.txt */
+                cinfo.comp_info[0].v_samp_factor = 1;
+                cinfo.comp_info[0].h_samp_factor = 1;
+                cinfo.comp_info[1].v_samp_factor = 1;
+                cinfo.comp_info[1].h_samp_factor = 1;
+            }
+            jpeg_default_qtables( &cinfo, TRUE );
+        }
+#endif // #if JPEG_LIB_VERSION >= 70
+
         jpeg_start_compress( &cinfo, TRUE );
 
         if( channels > 1 )

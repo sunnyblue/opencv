@@ -40,8 +40,15 @@
 //
 //M*/
 
-#import "opencv2/highgui/cap_ios.h"
+#import <UIKit/UIKit.h>
+#import <Accelerate/Accelerate.h>
+#import <AVFoundation/AVFoundation.h>
+#import <ImageIO/ImageIO.h>
+#include "opencv2/core.hpp"
 #include "precomp.hpp"
+
+UIImage* MatToUIImage(const cv::Mat& image);
+void UIImageToMat(const UIImage* image, cv::Mat& m, bool alphaExist);
 
 UIImage* MatToUIImage(const cv::Mat& image) {
 
@@ -59,6 +66,10 @@ UIImage* MatToUIImage(const cv::Mat& image) {
     CGDataProviderRef provider =
             CGDataProviderCreateWithCFData((__bridge CFDataRef)data);
 
+    // Preserve alpha transparency, if exists
+    bool alpha = image.channels() == 4;
+    CGBitmapInfo bitmapInfo = (alpha ? kCGImageAlphaLast : kCGImageAlphaNone) | kCGBitmapByteOrderDefault;
+
     // Creating CGImage from cv::Mat
     CGImageRef imageRef = CGImageCreate(image.cols,
                                         image.rows,
@@ -66,8 +77,7 @@ UIImage* MatToUIImage(const cv::Mat& image) {
                                         8 * image.elemSize(),
                                         image.step.p[0],
                                         colorSpace,
-                                        kCGImageAlphaNone|
-                                        kCGBitmapByteOrderDefault,
+                                        bitmapInfo,
                                         provider,
                                         NULL,
                                         false,
@@ -113,5 +123,4 @@ void UIImageToMat(const UIImage* image,
     CGContextDrawImage(contextRef, CGRectMake(0, 0, cols, rows),
                        image.CGImage);
     CGContextRelease(contextRef);
-    CGColorSpaceRelease(colorSpace);
 }

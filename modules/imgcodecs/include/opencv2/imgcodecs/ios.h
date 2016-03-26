@@ -41,8 +41,17 @@
 //
 //M*/
 
+#import <UIKit/UIKit.h>
+#import <Accelerate/Accelerate.h>
+#import <AVFoundation/AVFoundation.h>
+#import <ImageIO/ImageIO.h>
 #include "opencv2/core/core.hpp"
+
+//! @addtogroup imgcodecs_ios
+//! @{
 
 UIImage* MatToUIImage(const cv::Mat& image);
 void UIImageToMat(const UIImage* image,
                          cv::Mat& m, bool alphaExist = false);
+
+//! @}
